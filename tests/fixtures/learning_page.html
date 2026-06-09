@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Relatório SMOW</title>
+    <script>window.secret = "token=abc";</script>
+  </head>
+  <body>
+    <a id="student-link" class="user link" href="/student?id=123456&token=secret">João joao@example.edu</a>
+    <button aria-label="Abrir relatório">Relatório</button>
+    <form method="post" action="/submit?session=abc">
+      <input type="hidden" name="csrf" value="secret">
+      <input type="text" name="query" value="João">
+    </form>
+    <iframe title="SMOW frame" src="/frame?ticket=abc"></iframe>
+    <table id="students">
+      <tr><th>Nome</th><th>Matrícula</th><th>Status</th></tr>
+      <tr><td>João</td><td>123456</td><td>Completo</td></tr>
+    </table>
+    <img src="/capture.jpg" alt="Capture">
+  </body>
+</html>

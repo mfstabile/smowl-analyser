@@ -209,6 +209,13 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# SMOW analyser local state and sensitive extraction outputs
+.secrets/
+data/
+*.har
+playwright-report/
+test-results/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
