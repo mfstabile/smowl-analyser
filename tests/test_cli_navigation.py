@@ -1,10 +1,13 @@
 import inspect
 
 from smowl_analyser.cli import (
+    _choose_captured_student_id,
     _current_page_report,
     _find_smowl_tool_option,
     _open_course,
     _run_manual_extract,
+    _run_single_student_extract,
+    _wait_for_computer_monitoring_data,
     _wait_for_smow_student_data,
 )
 from smowl_analyser.models import LinkOption
@@ -159,8 +162,46 @@ def test_wait_for_smow_student_data_waits_for_required_api_responses():
     assert _wait_for_smow_student_data(FakeWaitingPage(), responses, timeout_ms=3_000)
 
 
+def test_wait_for_computer_monitoring_data_waits_for_student_payload():
+    responses: list[dict] = []
+
+    class FakeWaitingPage:
+        waits = 0
+
+        def wait_for_timeout(self, _timeout):
+            self.waits += 1
+            if self.waits == 2:
+                responses.append(
+                    {
+                        "url": "https://results-api.smowltech.net/index.php/V2/monitoring/evidence/computerMonitoring",
+                        "payload": {"userId": "student-1", "evidence": []},
+                    }
+                )
+
+    assert _wait_for_computer_monitoring_data(FakeWaitingPage(), responses, timeout_ms=3_000)
+
+
+def test_choose_captured_student_id_returns_single_capture():
+    responses = [
+        {
+            "url": "https://results-api.smowltech.net/index.php/V2/monitoring/evidence/computerMonitoring",
+            "payload": {"userId": "student-1", "evidence": []},
+        }
+    ]
+
+    assert _choose_captured_student_id(responses) == "student-1"
+
+
 def test_manual_extract_flow_uses_browser_context_capture():
     source = inspect.getsource(_run_manual_extract)
 
     assert "def flow(page, context):" in source
     assert "capture.attach_context(context)" in source
+
+
+def test_single_student_extract_flow_uses_student_id_filter():
+    source = inspect.getsource(_run_single_student_extract)
+
+    assert "def flow(page, context):" in source
+    assert "capture.attach_context(context)" in source
+    assert "student_ids={student_id}" in source

@@ -287,6 +287,27 @@ def parse_students_from_responses(
     return students
 
 
+def computer_monitoring_user_ids_from_responses(responses: list[dict[str, Any]]) -> list[str]:
+    user_ids: list[str] = []
+    seen: set[str] = set()
+    for response in responses:
+        url = response.get("url", "")
+        if (
+            "/V2/monitoring/evidence/computerMonitoring" not in url
+            and "/V2/resultsReasonsCaptures/computerMonitoring" not in url
+        ):
+            continue
+        payload = response.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        user_id = _payload_user_id(payload)
+        if not user_id or user_id in seen:
+            continue
+        seen.add(user_id)
+        user_ids.append(user_id)
+    return user_ids
+
+
 def extract_report(
     page: Any,
     selection: Selection,
@@ -295,6 +316,7 @@ def extract_report(
     existing_report: ExtractionReport | None = None,
     existing_progress: Progress | None = None,
     api_responses: list[dict[str, Any]] | None = None,
+    student_ids: set[str] | None = None,
     download_workers: int = DEFAULT_DOWNLOAD_WORKERS,
     download_progress: DownloadProgressCallback | None = None,
 ) -> ExtractionResult:
@@ -302,7 +324,14 @@ def extract_report(
         raise ValueError("A report selection is required for extraction.")
 
     activity_id = selection.report.metadata.get("activity_id") if selection.report.metadata else None
+    student_filter = _normalize_student_id_filter(student_ids)
     students = parse_students_from_responses(api_responses or [], activity_id=activity_id)
+    students = _filter_students(students, student_filter)
+    if student_filter and api_responses:
+        students = _merge_students(
+            students,
+            _student_stubs_from_computer_monitoring(api_responses, activity_id, student_filter),
+        )
     if not students:
         if (
             not selection.report.url.startswith("smow-api://")
@@ -311,6 +340,7 @@ def extract_report(
             page.goto(selection.report.url)
         html, url = _best_smow_html(page)
         students = parse_students_from_html(html, url)
+        students = _filter_students(students, student_filter)
     report = existing_report or ExtractionReport(
         run=RunInfo(
             id=storage.run_id,
@@ -325,6 +355,7 @@ def extract_report(
         for student in students:
             known.setdefault(student.id, student)
         report.students = list(known.values())
+        report.students = _filter_students(report.students, student_filter)
 
     progress = existing_progress or Progress(run_id=storage.run_id)
     progress.ensure_students(report.students)
@@ -406,6 +437,64 @@ def extract_report(
         storage.save_report(report)
 
     return ExtractionResult(report=report, progress=progress)
+
+
+def _normalize_student_id_filter(student_ids: set[str] | None) -> set[str]:
+    if not student_ids:
+        return set()
+    result: set[str] = set()
+    for student_id in student_ids:
+        if not student_id:
+            continue
+        raw = str(student_id).strip()
+        if not raw:
+            continue
+        result.add(raw)
+        result.add(safe_slug(raw, raw))
+    return result
+
+
+def _filter_students(students: list[StudentRecord], student_filter: set[str]) -> list[StudentRecord]:
+    if not student_filter:
+        return students
+    return [student for student in students if student.id in student_filter]
+
+
+def _merge_students(
+    students: list[StudentRecord],
+    additions: list[StudentRecord],
+) -> list[StudentRecord]:
+    known = {student.id: student for student in students}
+    for student in additions:
+        known.setdefault(student.id, student)
+    return list(known.values())
+
+
+def _student_stubs_from_computer_monitoring(
+    responses: list[dict[str, Any]],
+    activity_id: str | None,
+    student_filter: set[str],
+) -> list[StudentRecord]:
+    names = _student_names_from_responses(responses)
+    files_by_user = _files_by_user_from_responses(responses, activity_id)
+    computer_monitoring_by_user = _computer_monitoring_by_user_from_responses(responses, activity_id)
+    students: list[StudentRecord] = []
+    for raw_student_id, events in computer_monitoring_by_user.items():
+        student_id = safe_slug(raw_student_id, f"student-{len(students) + 1}")
+        if student_filter and raw_student_id not in student_filter and student_id not in student_filter:
+            continue
+        student = StudentRecord(
+            id=student_id,
+            name=names.get(raw_student_id, raw_student_id),
+            source_url="smow-api:/monitoring/evidence/computerMonitoring",
+            smow=SmowData(
+                computer_monitoring=events,
+                source_url="smow-api:/monitoring/evidence/computerMonitoring",
+            ),
+        )
+        student.files = files_by_user.get(raw_student_id, [])
+        students.append(student)
+    return students
 
 
 def _hydrate_computer_monitoring_from_storage(
@@ -1057,6 +1146,13 @@ def _activity_name_from_responses(
             activities = user.get("activities")
             if isinstance(activities, dict) and activities:
                 return str(next(iter(activities.keys())))
+    for response in responses:
+        payload = response.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        activity_name = payload.get("activityName")
+        if activity_name:
+            return str(activity_name)
     return None
 
 

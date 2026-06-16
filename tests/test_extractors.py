@@ -8,6 +8,7 @@ from smowl_analyser.extractors.blackboard import (
 )
 from smowl_analyser.extractors.smow import (
     collect_student_evidence_requests,
+    computer_monitoring_user_ids_from_responses,
     discover_reports_from_responses,
     extract_report,
     parse_file_references_from_html,
@@ -703,6 +704,155 @@ def test_extract_report_downloads_images_immediately_after_each_student_json(
     assert "files/student-2/0001-screen.png" in storage.student_computer_monitoring_path(
         "student-2"
     ).read_text(encoding="utf-8")
+
+
+def test_extract_report_filters_to_single_student(tmp_path, monkeypatch):
+    class FakeApiResponse:
+        ok = True
+        status = 200
+
+        def __init__(self, user_id):
+            self.user_id = user_id
+
+        def json(self):
+            return {
+                "activityName": "testactivity-1",
+                "userId": self.user_id,
+                "evidence": [
+                    {
+                        "id": f"event-{self.user_id}",
+                        "src": f"https://smowl-prod-cm.s3.eu-west-1.amazonaws.com/{self.user_id}/screen.png",
+                    }
+                ],
+            }
+
+    class FakeRequest:
+        def post(self, _url, **kwargs):
+            payload = kwargs.get("form") or kwargs.get("data") or {}
+            return FakeApiResponse(payload.get("userId"))
+
+    class FakePage:
+        url = "https://front-results.smowltech.net/index.php/ActivityStatus"
+        frames = []
+        request = FakeRequest()
+
+    responses = [
+        {
+            "url": "https://lti-smowl-global.smowltech.net/lti/ajax/students?state=abc",
+            "payload": {"student-1": "Student One", "student-2": "Student Two"},
+        },
+        {
+            "url": "https://results-api.smowltech.net/index.php/V2/results/figures",
+            "request_headers": {"authorization": "Bearer token"},
+            "payload": {
+                "users": [
+                    {"userId": "student-1", "activities": {"testactivity-1": {}}},
+                    {"userId": "student-2", "activities": {"testactivity-1": {}}},
+                ]
+            },
+        },
+    ]
+    selection = Selection(
+        report=LinkOption(
+            id="current-smow-student-list",
+            title="SMOW Results",
+            url=FakePage.url,
+            metadata={"source": "current-page", "activity_id": "activity-1"},
+        )
+    )
+    storage = RunStorage(runs_dir=tmp_path)
+    storage.prepare()
+
+    def fake_parallel_download(task, run_storage):
+        return run_storage.save_file(
+            task.student_id,
+            f"{task.index:04d}-screen.png",
+            b"png-bytes",
+            original_url=task.file_ref.original_url,
+            mime_type="image/png",
+        )
+
+    monkeypatch.setattr(smow_module, "_download_file_with_urllib", fake_parallel_download)
+
+    result = extract_report(
+        FakePage(),
+        selection,
+        storage,
+        api_responses=responses,
+        student_ids={"student-2"},
+        download_workers=2,
+    )
+
+    assert [student.id for student in result.report.students] == ["student-2"]
+    assert storage.student_computer_monitoring_path("student-2").exists()
+    assert not storage.student_computer_monitoring_path("student-1").exists()
+    assert (storage.root / "files/student-2/0001-screen.png").exists()
+
+
+def test_extract_report_creates_single_student_from_computer_monitoring_payload(tmp_path):
+    class FakePage:
+        url = "https://front-results.smowltech.net/index.php/ActivityStatus"
+        frames = []
+
+    responses = [
+        {
+            "url": "https://results-api.smowltech.net/index.php/V2/monitoring/evidence/computerMonitoring",
+            "payload": {
+                "activityName": "testactivity-1",
+                "userId": "student-1",
+                "evidence": [
+                    {
+                        "id": "event-1",
+                        "date": "2026-06-04 10:00:00",
+                        "detail": {"type": "CM_CLOSED_MANUALLY"},
+                    }
+                ],
+            },
+        }
+    ]
+    selection = Selection(
+        report=LinkOption(
+            id="current-smow-student",
+            title="SMOW Student",
+            url=FakePage.url,
+            metadata={"source": "current-page"},
+        )
+    )
+    storage = RunStorage(runs_dir=tmp_path)
+    storage.prepare()
+
+    result = extract_report(
+        FakePage(),
+        selection,
+        storage,
+        api_responses=responses,
+        student_ids={"student-1"},
+        download_workers=1,
+    )
+
+    assert [student.id for student in result.report.students] == ["student-1"]
+    assert result.report.students[0].name == "student-1"
+    assert result.report.students[0].smow.computer_monitoring[0]["type"] == "CM_CLOSED_MANUALLY"
+    assert storage.student_computer_monitoring_path("student-1").exists()
+
+
+def test_computer_monitoring_user_ids_from_responses_preserves_capture_order():
+    responses = [
+        {
+            "url": "https://results-api.smowltech.net/index.php/V2/monitoring/evidence/computerMonitoring",
+            "payload": {"userId": "student-2", "evidence": []},
+        },
+        {
+            "url": "https://results-api.smowltech.net/index.php/V2/resultsReasonsCaptures/computerMonitoring",
+            "payload": {"userId": "student-1", "activities": {}},
+        },
+        {
+            "url": "https://results-api.smowltech.net/index.php/V2/monitoring/evidence/computerMonitoring",
+            "payload": {"userId": "student-2", "evidence": []},
+        },
+    ]
+
+    assert computer_monitoring_user_ids_from_responses(responses) == ["student-2", "student-1"]
 
 
 def test_extract_report_resume_hydrates_computer_monitoring_from_student_json(

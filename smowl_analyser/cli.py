@@ -15,6 +15,7 @@ from .diagnostics import DEFAULT_DIAGNOSTICS_DIR, DiagnosticSession
 from .extractors.blackboard import discover_courses, discover_smow_activities
 from .extractors.smow import (
     DEFAULT_DOWNLOAD_WORKERS,
+    computer_monitoring_user_ids_from_responses,
     discover_reports,
     discover_reports_from_responses,
     extract_report,
@@ -113,6 +114,28 @@ def extract(
 ) -> None:
     """Let you navigate to the SMOW student list, then extract from the current page."""
     _run_manual_extract(
+        url=url,
+        state_path=state_path,
+        runs_dir=runs_dir,
+        slow_mo_ms=slow_mo_ms,
+        download_workers=download_workers,
+    )
+
+
+@app.command("extract-student")
+def extract_student(
+    url: str = typer.Option(DEFAULT_BLACKBOARD_URL, "--url", help="Blackboard landing URL."),
+    state_path: Path | None = typer.Option(None, help="Path to saved Playwright storage state."),
+    runs_dir: Path = typer.Option(DEFAULT_RUNS_DIR, help="Directory where runs are stored."),
+    slow_mo_ms: int = typer.Option(0, help="Slow Playwright interactions by N milliseconds."),
+    download_workers: int = typer.Option(
+        DEFAULT_DOWNLOAD_WORKERS,
+        min=1,
+        help="Number of parallel image downloads for the selected student's ComputerMonitoring screenshots.",
+    ),
+) -> None:
+    """Let you navigate to one SMOW student page, then extract only that student."""
+    _run_single_student_extract(
         url=url,
         state_path=state_path,
         runs_dir=runs_dir,
@@ -350,6 +373,82 @@ def _run_manual_extract(
         manifest.finished_at = utc_now()
         storage.save_manifest(manifest)
         console.print(f"Extraction saved to [bold]{storage.root}[/bold]")
+
+    session.run_with_context_page(flow)
+
+
+def _run_single_student_extract(
+    *,
+    url: str,
+    state_path: Path | None,
+    runs_dir: Path,
+    slow_mo_ms: int = 0,
+    download_workers: int = DEFAULT_DOWNLOAD_WORKERS,
+) -> None:
+    storage = RunStorage(runs_dir=runs_dir)
+    storage.prepare()
+    session = BrowserSession(
+        BrowserConfig(
+            state_path=_state_path(state_path),
+            headless=False,
+            slow_mo_ms=slow_mo_ms,
+        )
+    )
+
+    def flow(page, context):
+        capture = JsonResponseCapture()
+        capture.attach_context(context)
+        page.goto(url)
+        typer.prompt(
+            "Navegue até a página do aluno específico no SMOW e pressione Enter",
+            default="",
+            show_default=False,
+        )
+        _settle(page)
+        if not _wait_for_computer_monitoring_data(page, capture.responses):
+            typer.prompt(
+                "Ainda não capturei o ComputerMonitoring desse aluno. "
+                "Abra/aguarde os detalhes de ComputerMonitoring na página do aluno e pressione Enter novamente",
+                default="",
+                show_default=False,
+            )
+            _settle(page)
+        if not _wait_for_computer_monitoring_data(page, capture.responses):
+            raise typer.BadParameter(
+                "ComputerMonitoring API data was not captured for a student. "
+                "Make sure the visible page is the SMOW student detail/evidence page."
+            )
+        student_id = _choose_captured_student_id(capture.responses)
+        report = _current_page_report(page, capture.responses)
+        report.metadata["single_student_id"] = student_id
+        selection = Selection(report=report)
+        storage.save_selection(selection)
+        manifest = storage.create_manifest(urls=_unique_urls([url, page.url, report.url]))
+        manifest.notes.append(f"Single-student extraction for captured SMOW user id: {student_id}")
+        storage.save_manifest(manifest)
+        result = extract_report(
+            page,
+            selection,
+            storage,
+            api_responses=capture.responses,
+            student_ids={student_id},
+            download_workers=download_workers,
+            download_progress=_download_progress_printer(download_workers),
+        )
+        total_files = sum(len(student.files) for student in result.report.students)
+        manifest.counts = {
+            "students": len(result.report.students),
+            "done": sum(1 for entry in result.progress.entries.values() if entry.status == "done"),
+            "failed": sum(1 for entry in result.progress.entries.values() if entry.status == "failed"),
+            "files": total_files,
+            "computer_monitoring_events": _computer_monitoring_event_count(result.report.students),
+            "computer_monitoring_screenshots": _computer_monitoring_screenshot_count(result.report.students),
+        }
+        if not result.report.students:
+            manifest.notes.append("No student record matched the captured ComputerMonitoring user id.")
+        manifest.finished_at = utc_now()
+        storage.save_manifest(manifest)
+        console.print(f"Single-student extraction saved to [bold]{storage.root}[/bold]")
 
     session.run_with_context_page(flow)
 
@@ -711,6 +810,35 @@ def _wait_for_smow_student_data(page, responses: list[dict], timeout_ms: int = 3
         page.wait_for_timeout(1_000)
         deadline -= 1_000
     return _has_smow_report_api_data(responses)
+
+
+def _wait_for_computer_monitoring_data(page, responses: list[dict], timeout_ms: int = 30_000) -> bool:
+    deadline = timeout_ms
+    while deadline >= 0:
+        if computer_monitoring_user_ids_from_responses(responses):
+            return True
+        page.wait_for_timeout(1_000)
+        deadline -= 1_000
+    return bool(computer_monitoring_user_ids_from_responses(responses))
+
+
+def _choose_captured_student_id(responses: list[dict]) -> str:
+    user_ids = computer_monitoring_user_ids_from_responses(responses)
+    if not user_ids:
+        raise typer.BadParameter("No ComputerMonitoring user id was captured.")
+    if len(user_ids) == 1:
+        console.print(f"Captured ComputerMonitoring user id: [bold]{user_ids[0]}[/bold]")
+        return user_ids[0]
+    table = Table(title="Captured ComputerMonitoring Students")
+    table.add_column("#", justify="right")
+    table.add_column("SMOW user id")
+    for index, user_id in enumerate(user_ids, start=1):
+        table.add_row(str(index), user_id)
+    console.print(table)
+    index = typer.prompt("Choose student number", type=int)
+    if index < 1 or index > len(user_ids):
+        raise typer.BadParameter(f"Invalid student number: {index}")
+    return user_ids[index - 1]
 
 
 def _print_options(title: str, options: Iterable[LinkOption]) -> None:

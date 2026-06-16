@@ -1,92 +1,297 @@
 # smowl-analyser
 
-Python CLI for extracting Blackboard + SMOW report data into local, auditable JSON output.
+CLI em Python para extrair dados do Blackboard + SMOW em arquivos locais auditáveis.
 
-## V1 scope
+A URL padrão do Blackboard é `https://insper.blackboard.com`. Use `--url` apenas se precisar
+apontar para outro ambiente.
 
-This first version extracts and stores data, then can generate a local triage report for human
-review. It does not generate images or make disciplinary conclusions.
+## Instalação
 
-The default Blackboard URL is `https://insper.blackboard.com`. Pass `--url` only when you need
-to override it.
+### Requisitos
 
-## Setup
+Instale antes de usar:
+
+- Python 3.12, recomendado;
+- `pip`;
+- Chromium gerenciado pelo Playwright;
+
+O projeto declara estas dependências Python em `pyproject.toml`:
+
+- `playwright`: automação do navegador;
+- `typer`: interface de linha de comando;
+- `rich`: tabelas e mensagens no terminal;
+- `pydantic`: modelos e validação dos JSONs;
+- `beautifulsoup4`: leitura de HTML como fallback;
+- `certifi`: certificados usados em downloads HTTPS;
+- `pytest`, apenas para desenvolvimento/testes.
+
+### Ambiente virtual
 
 ```bash
-python3 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 playwright install chromium
 ```
 
-## Recommended flow
+Se o seu comando local for apenas `python3`, use:
+
+```bash
+python3 -m venv .venv
+```
+
+Depois da instalação, confira se o comando foi registrado:
+
+```bash
+smowl-analyser --help
+```
+
+## Primeiro Uso
+
+### Verificar ambiente
 
 ```bash
 smowl-analyser doctor
+```
+
+Esse comando verifica se as dependências estão importáveis, se a sessão do Playwright já existe e
+onde as execuções serão salvas. Ele não abre Blackboard nem SMOW.
+
+### Fazer login
+
+```bash
+smowl-analyser login
+```
+
+O comando abre um Chromium visível. Faça login manualmente no Blackboard, incluindo SSO/MFA quando
+necessário. Depois volte ao terminal e pressione Enter.
+
+A sessão autenticada fica salva em:
+
+```text
+.secrets/playwright-state.json
+```
+
+O programa não armazena sua senha. Os próximos comandos reutilizam essa sessão.
+
+Opções úteis:
+
+```bash
+smowl-analyser login --slow-mo-ms 250
+smowl-analyser login --url "https://outro.blackboard.example"
+```
+
+## Fluxo Recomendado
+
+Para baixar a turma inteira:
+
+```bash
 smowl-analyser login
 smowl-analyser extract
 smowl-analyser analyze --run-id "<run_id>"
 ```
 
-The recommended extraction path is now manual navigation until the SMOW student list. Use
-`extract`, navigate yourself to the page where the students are listed, press Enter in the
-terminal, and let the tool download the available structured data and evidence files from there.
-
-Use `auto-extract` only for the older semi-automatic crawler flow. Use `learn` when the crawler
-needs to be recalibrated against the real Blackboard/SMOW page structure. Use `resume` after an
-extraction stops in the middle. Use `analyze` after extraction to create a local HTML triage
-report.
-
-If `extract` says it did not capture SMOW internal data, run `smowl-analyser diagnose`, navigate
-to the same page, and inspect `data/diagnostics/{session_id}/summary.json`.
-
-## Commands
-
-### `doctor`
-
-Checks whether the local environment is ready.
-
-```bash
-smowl-analyser doctor
-```
-
-It reports:
-
-- whether the Playwright session file exists;
-- whether required Python packages are importable;
-- where extraction runs will be stored.
-
-This command does not open the browser and does not access Blackboard.
-
-### `login`
-
-Opens a visible Chromium browser so you can log in manually through Blackboard/SSO/MFA.
+Para baixar somente um aluno:
 
 ```bash
 smowl-analyser login
+smowl-analyser extract-student
 ```
 
-After login, return to the terminal and press Enter. The authenticated browser session is saved
-to `.secrets/playwright-state.json`, so later commands can reuse it without storing your password.
+Use `resume` quando uma extração for interrompida. Use os comandos de diagnóstico do fim deste
+README somente quando for necessário investigar falhas ou evoluir o crawler.
 
-Useful options:
+## Modos De Extração
+
+### `extract`
+
+Modo principal para extrair uma turma inteira a partir da lista de alunos do SMOW.
 
 ```bash
-smowl-analyser login --url "https://another.blackboard.host"
-smowl-analyser login --slow-mo-ms 250
+smowl-analyser extract
 ```
+
+Fluxo:
+
+1. O navegador abre no Blackboard usando a sessão salva.
+2. Você navega manualmente até a página do SMOW onde aparece a lista de alunos.
+3. Quando a lista estiver carregada, volte ao terminal e pressione Enter.
+4. O programa captura as respostas internas do SMOW, identifica os alunos e baixa os dados.
+
+Para cada aluno, o comando:
+
+- busca o JSON de ComputerMonitoring;
+- salva `students/{student_id}/computer_monitoring.json`;
+- baixa as imagens/evidências vinculadas ao ComputerMonitoring;
+- salva os arquivos em `files/{student_id}/...`;
+- atualiza `progress.json` aluno por aluno.
+
+Use `--download-workers` para controlar downloads paralelos de imagens:
+
+```bash
+smowl-analyser extract --download-workers 8
+```
+
+Use `--download-workers 1` para baixar de forma sequencial.
+
+### `extract-student`
+
+Modo para baixar somente um aluno específico.
+
+```bash
+smowl-analyser extract-student
+```
+
+Fluxo:
+
+1. O navegador abre no Blackboard usando a sessão salva.
+2. Você navega manualmente até a página de evidências de
+   Computer Monitoring desse aluno na aba Full report.
+3. Aguarde o ComputerMonitoring carregar.
+4. Volte ao terminal e pressione Enter.
+
+O comando procura o `userId` capturado nas chamadas de ComputerMonitoring. Se mais de um aluno
+aparecer nas respostas durante a navegação, ele mostra uma tabela e pergunta qual deve ser
+extraído.
+
+A saída usa a mesma estrutura de `extract`, mas normalmente contém apenas um aluno:
+
+- `report.json`: índice compacto da execução;
+- `students/{student_id}/computer_monitoring.json`: eventos de ComputerMonitoring do aluno;
+- `files/{student_id}/...`: imagens/evidências baixadas e ligadas ao JSON.
+
+Também aceita:
+
+```bash
+smowl-analyser extract-student --download-workers 8
+```
+
+Esse modo não precisa que a lista de todos os alunos esteja carregada. Ele pode criar o registro
+local diretamente a partir do JSON de ComputerMonitoring do aluno aberto.
+
+### `resume`
+
+Continua uma extração interrompida.
+
+```bash
+smowl-analyser resume --run-id "20260602-000000"
+```
+
+O `run_id` é o nome da pasta dentro de `data/runs/`. O comando lê `selection.json`,
+`report.json` e `progress.json`, e tenta novamente alunos pendentes ou com falha.
+
+Também aceita:
+
+```bash
+smowl-analyser resume --run-id "20260602-000000" --download-workers 8
+```
+
+## Análise Local
+
+### `analyze`
+
+Gera um relatório HTML local a partir de uma extração já feita.
+
+```bash
+smowl-analyser analyze --run-id "20260602-000000"
+```
+
+O comando lê os arquivos locais `students/*/computer_monitoring.json`. Ele não acessa Blackboard,
+SMOW ou internet.
+
+Saídas:
+
+- `analysis/report.html`: relatório visual para revisão humana;
+- `analysis/summary.json`: achados estruturados para uso futuro.
+
+As regras iniciais sinalizam:
+
+- ComputerMonitoring fechado e depois relançado;
+- programas incomuns em relação ao restante da turma;
+- títulos/sites incomuns em relação ao restante da turma;
+- cópia/cola de múltiplas linhas, especialmente quando o texto parece código.
+
+Isso é triagem para revisão humana, não conclusão disciplinar.
+
+Opção útil:
+
+```bash
+smowl-analyser analyze --run-id "20260602-000000" --rarity-ratio 0.05
+```
+
+## Estrutura Dos Dados
+
+Cada execução fica em:
+
+```text
+data/runs/{run_id}/
+```
+
+Arquivos principais:
+
+- `report.json`: índice compacto da execução, com metadados e resumo dos alunos. Ele omite
+  `students[].files` e `students[].smow.computer_monitoring`, porque esses detalhes ficam nos
+  arquivos individuais;
+- `manifest.json`: metadados da execução, URLs, versão do extrator, horários e contagens;
+- `selection.json`: curso/atividade/relatório quando disponíveis;
+- `progress.json`: alunos pendentes, concluídos e com falha;
+- `students/{student_id}/computer_monitoring.json`: eventos de ComputerMonitoring do aluno;
+- `files/{student_id}/...`: imagens/evidências baixadas.
+
+Dados locais sensíveis:
+
+- sessão: `.secrets/playwright-state.json`;
+- extrações: `data/runs/{run_id}/`;
+- diagnósticos: `data/diagnostics/{session_id}/`;
+- aprendizado: `data/learning/{session_id}/`.
+
+Esses diretórios devem permanecer fora do Git.
+
+## Desenvolvimento E Diagnóstico
+
+Os comandos abaixo são voltados para investigação, manutenção e melhoria do crawler. Eles devem
+ficar para o fim do fluxo normal de uso.
+
+### `inspect`
+
+Inspeciona cursos, atividade SMOW, relatórios e alunos sem baixar evidências.
+
+```bash
+smowl-analyser inspect
+```
+
+Esse comando tenta navegar pelo Blackboard automaticamente. Use apenas para verificar se o crawler
+consegue encontrar os elementos esperados. Para extração real, prefira `extract`.
+
+### `diagnose`
+
+Captura um pacote sanitizado de diagnóstico depois que você navega manualmente até a lista de
+alunos do SMOW.
+
+```bash
+smowl-analyser diagnose
+```
+
+Salva em `data/diagnostics/{session_id}/`:
+
+- `summary.json`: contagens de páginas, frames e endpoints SMOW;
+- `pages.json` e `frames.json`: URLs, títulos e caminhos dos artefatos salvos;
+- `network/responses.json`: metadados sanitizados das respostas;
+- `network/json_responses.json`: payloads JSON sanitizados;
+- `pages/*.html` e `frames/*.html`: HTML sanitizado.
+
+Use quando `extract` não capturar dados internos do SMOW ou quando for necessário entender quais
+endpoints a interface acionou.
 
 ### `learn`
 
-Records the real manual path through Blackboard and SMOW so the crawler can be improved safely.
-It saves sanitized HTML, page summaries, frame snapshots, route data, network deltas, JSON/API
-responses and download event metadata.
+Registra o caminho real feito no Blackboard/SMOW para ajudar a melhorar o crawler.
 
 ```bash
 smowl-analyser learn
 ```
 
-The command opens the browser and asks you to navigate manually through these checkpoints:
+O comando pede checkpoints manuais, por exemplo:
 
 1. Chegue na página da turma e pressione Enter.
 2. Abra o SMOW e chegue na lista de alunos monitorados; depois pressione Enter.
@@ -96,174 +301,13 @@ The command opens the browser and asks you to navigate manually through these ch
 6. Clique no botão de download do aluno ou de relatório individual e pressione Enter.
 7. Abra uma evidência/imagem específica, se existir, e pressione Enter.
 
-Output is saved in `data/learning/{session_id}/`.
+Salva em `data/learning/{session_id}/` HTML sanitizado, resumos de página, frames, rotas, deltas
+de rede, respostas JSON/API e metadados de download. Não salva screenshots nem gera imagens.
 
-For each checkpoint, `learn` saves per-checkpoint files in `network/` showing which requests and
-downloads appeared after that action. This is the main tool for discovering which SMOW click
-triggers evidence/download endpoints.
+## Testes
 
-It does not save screenshots or generate images. HTML, JSON values and URLs are sanitized to
-reduce exposure of cookies, tokens, emails and long numeric identifiers.
-
-### `inspect`
-
-Runs a dry inspection of the available course, SMOW activity, report and student list.
+Para rodar os testes:
 
 ```bash
-smowl-analyser inspect
+.venv/bin/python -m pytest
 ```
-
-The command opens Blackboard, moves to the `Cursos` tab, lists real course pages, and then follows
-the selected course into SMOW.
-
-Use this before a full extraction to confirm that the crawler is finding the expected course and
-SMOW report. It may ask you to choose from options in the terminal. It does not download evidence
-files.
-
-### `manual-extract`
-
-Alias for `extract`. It opens Blackboard with your saved session and waits while you navigate
-manually to the SMOW page where the report/list of students is visible.
-
-```bash
-smowl-analyser manual-extract
-```
-
-When the student list is open in the browser, return to the terminal and press Enter. From that
-point onward, the tool automatically:
-
-- captures SMOW JSON/API responses that loaded during your navigation;
-- parses the current SMOW page or SMOW results frame;
-- clicks known per-student SMOW detail controls such as `FrontCamera` and `ComputerMonitoring`
-  to trigger evidence JSON endpoints;
-- creates `selection.json`, `manifest.json`, `progress.json` and `report.json`;
-- creates `students/{student_id}/computer_monitoring.json` for a student;
-- immediately downloads that student's ComputerMonitoring screenshots in parallel and links them
-  back into the JSON before moving to the next student;
-- saves progress student by student, so `resume` can continue later.
-
-This command does not ask you to choose course, activity or report. It uses the current browser
-page as the report starting point.
-
-### `extract`
-
-Opens Blackboard with your saved session and waits while you navigate manually to the SMOW page
-where the report/list of students is visible.
-
-```bash
-smowl-analyser extract
-```
-
-When the student list is open in the browser, return to the terminal and press Enter. From that
-point onward, the tool automatically captures the current page as the report starting point,
-parses students and fetches ComputerMonitoring data for each student. For each student, it saves
-`students/{student_id}/computer_monitoring.json`, immediately downloads that student's screenshots
-under `files/{student_id}/...` in parallel, and links them back through
-`screenshots[].local_path`. This avoids letting short-lived SMOW image URLs expire while later
-students are still being processed.
-
-Use `--download-workers` to control parallel image downloads:
-
-```bash
-smowl-analyser extract --download-workers 8
-```
-
-Use `--download-workers 1` for the older sequential download behavior.
-
-This command does not ask you to choose course, activity or report.
-
-### `diagnose`
-
-Captures a sanitized diagnostic bundle after you navigate manually to the SMOW student list.
-
-```bash
-smowl-analyser diagnose
-```
-
-The command does not download evidence files and does not save screenshots. It saves:
-
-- `summary.json`: pages, frames, domain counts and SMOW endpoint counts;
-- `pages.json` and `frames.json`: URLs, titles and saved artifact paths;
-- `network/responses.json`: sanitized response metadata from the whole browser context;
-- `network/json_responses.json`: sanitized JSON payloads captured from the whole browser context;
-- `pages/*.html` and `frames/*.html`: sanitized HTML snapshots.
-
-Use this when `extract` cannot see `/lti/ajax/students` or `/V2/results/figures`. The important
-signals are `has_smowlresults_frame`, `has_front_results_frame`, `lti_ajax_students`,
-`results_figures` and `monitoring_evidence`.
-
-### `auto-extract`
-
-Runs the older semi-automatic crawler flow.
-
-```bash
-smowl-analyser auto-extract
-```
-
-The command opens Blackboard, moves to the `Cursos` tab, asks you to choose a course, opens the
-selected SMOW activity, and then tries to discover a report automatically.
-
-The extractor now prefers SMOW JSON/API responses captured while the page loads. If the report data
-has not loaded yet, it will ask you to navigate to the report/list of students and press Enter.
-It accepts the same `--download-workers` option as `extract`.
-
-Each run is stored in `data/runs/{run_id}/` with files like:
-
-- `report.json`: compact run index with course/activity/student summary data. It intentionally
-  omits `students[].files` and `students[].smow.computer_monitoring`, because those details live
-  in the per-student ComputerMonitoring files;
-- `manifest.json`: run metadata, URLs and counts;
-- `selection.json`: selected course, SMOW activity and report;
-- `progress.json`: pending, completed and failed students;
-- `students/{student_id}/computer_monitoring.json`: ComputerMonitoring events for one student,
-  including type, timestamp, incident flag, detail payload and linked screenshots;
-- `files/{student_id}/...`: downloaded evidence files/images when available.
-
-### `resume`
-
-Continues an extraction that stopped before all students were processed.
-
-```bash
-smowl-analyser resume --run-id "20260602-000000"
-```
-
-The `run_id` is the folder name under `data/runs/`. The command reads the existing
-`selection.json`, `report.json` and `progress.json`, then retries pending or failed students.
-It also accepts `--download-workers` for the image download phase.
-
-### `analyze`
-
-Generates a local HTML triage report from an already extracted run.
-
-```bash
-smowl-analyser analyze --run-id "20260602-000000"
-```
-
-The command reads local `computer_monitoring.json` files and does not access Blackboard, SMOW or
-the internet. It saves:
-
-- `analysis/report.html`: human-readable report for review;
-- `analysis/summary.json`: structured findings for future automation.
-
-The initial rules flag:
-
-- ComputerMonitoring closed and later launched again;
-- programs opened by at most 10% of the class, excluding a small built-in allowlist;
-- uncommon external navigation window titles, based on `window_title`;
-- copy/paste events with two or more non-empty lines, especially when the text looks like code.
-
-Useful option:
-
-```bash
-smowl-analyser analyze --run-id "20260602-000000" --rarity-ratio 0.05
-```
-
-## Local data
-
-Local session state is stored in `.secrets/playwright-state.json`.
-Extraction output is stored in `data/runs/{run_id}/`.
-Learning output is stored in `data/learning/{session_id}/`.
-Diagnostic output is stored in `data/diagnostics/{session_id}/`.
-
-These directories are ignored by Git because they can contain sensitive academic and proctoring
-data.
